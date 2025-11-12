@@ -2,6 +2,7 @@ import os
 import io
 import json
 import logging
+import asyncio # <-- Added import
 from flask import Flask, request, jsonify
 
 from telegram import Update
@@ -13,23 +14,19 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
 # --- Configuration Section ---
-# These values are read from Environment Variables in Render
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 DRIVE_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID")
-# This is the Google credentials JSON file, added as a "Secret File" in Render
-# We set its path in this environment variable
 SERVICE_ACCOUNT_FILE = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "google_creds.json")
-
-# Your public URL on Render (for setting the Webhook)
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL") 
 
-# Logging setup (for debugging in Render)
+# Logging setup
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
 # --- Google Drive Section ---
+# (This section is unchanged)
 
 def get_drive_service():
     """
@@ -64,10 +61,10 @@ def upload_to_drive(service, file_stream, file_name):
         return None
 
 # --- Telegram Bot Section ---
+# (This section is unchanged)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Response to the /start command"""
-    # User-facing language remains Persian
     await update.message.reply_text("سلام! 👋\nهر فایل، عکس یا فیلمی بفرستی، من آن را در گوگل درایو ذخیره می‌کنم.")
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -78,7 +75,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_name = ""
     file_to_process = None
 
-    # Detect file type
     if message.document:
         file_to_process = message.document
         file_name = message.document.file_name
@@ -86,7 +82,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_to_process = message.video
         file_name = message.video.file_name or f"video_{message.video.file_unique_id}.mp4"
     elif message.photo:
-        # Photos in Telegram have multiple sizes, we get the largest (last) one
         file_to_process = message.photo[-1]
         file_name = f"photo_{file_to_process.file_unique_id}.jpg"
     elif message.audio:
@@ -94,54 +89,41 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_name = message.audio.file_name or f"audio_{message.audio.file_unique_id}.mp3"
     
     if not file_to_process:
-        # User-facing language remains Persian
         await message.reply_text("فرمت فایل پشتیبانی نمی‌شود.")
         return
 
-    # Send a "Processing..." message
-    # User-facing language remains Persian
     status_message = await message.reply_text("در حال دریافت فایل از تلگرام...")
     
     try:
-        # 1. Download the file from Telegram into memory
         file_id = file_to_process.file_id
         bot_file = await context.bot.get_file(file_id)
         
-        # Download the file into an in-memory byte stream
         file_stream = io.BytesIO()
         await bot_file.download_to_memory(file_stream)
-        file_stream.seek(0) # Rewind the stream to the beginning
+        file_stream.seek(0)
         
-        # User-facing language remains Persian
         await status_message.edit_text("در حال آپلود در گوگل درایو... ☁️")
         
-        # 2. Upload the file to Google Drive
-        # Since Google API functions are synchronous,
-        # we run them in a separate thread to avoid blocking the bot
         service = await context.application.loop.run_in_executor(None, get_drive_service)
         
         file_link = await context.application.loop.run_in_executor(
             None, upload_to_drive, service, file_stream, file_name
         )
 
-        # 3. Send a success message
         if file_link:
-            # User-facing language remains Persian
             await status_message.edit_text(
                 f"✅ فایل با موفقیت آپلود شد!\n\n<a href='{file_link}'>{file_name}</a>",
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True
             )
         else:
-            # User-facing language remains Persian
             await status_message.edit_text("❌ مشکلی در آپلود فایل پیش آمد.")
             
     except Exception as e:
         logger.error(f"General error processing file: {e}")
-        # User-facing language remains Persian
         await status_message.edit_text(f"خطا: {e}")
 
-# --- Flask Web Server Section ---
+# --- Bot and Flask Initialization ---
 
 # Initialize the Flask application
 app = Flask(__name__)
@@ -153,13 +135,33 @@ telegram_app = (
 
 # Add commands to the bot
 telegram_app.add_handler(CommandHandler("start", start))
-# This MessageHandler handles all files
 telegram_app.add_handler(
     MessageHandler(
         filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO, 
         handle_file
     )
 )
+
+# --- Webhook Setup Function (Modified) ---
+async def setup_bot_and_webhook():
+    """
+    Initializes the bot application AND sets the webhook.
+    """
+    logger.info("Initializing application...")
+    await telegram_app.initialize() # <-- THIS IS THE FIX
+    
+    if not WEBHOOK_URL:
+        logger.error("WEBHOOK_URL is not set in environment variables.")
+        return
+        
+    full_webhook_url = f"{WEBHOOK_URL}/webhook"
+    
+    logger.info(f"Setting webhook to {full_webhook_url}...")
+    await telegram_app.bot.set_webhook(full_webhook_url)
+    logger.info("Webhook set successfully.")
+
+
+# --- Flask Web Server Routes ---
 
 @app.route("/")
 def index():
@@ -177,39 +179,30 @@ async def webhook():
             await telegram_app.process_update(update)
             return jsonify({"status": "ok"})
         except Exception as e:
-            logger.warning(f"Error processing update: {e}")
-            return jsonify({"status": "error"}), 500
+            # Log the *actual* error
+            logger.error(f"Error processing update: {e}")
+            return jsonify({"status": "error", "message": str(e)}), 500
     return jsonify({"status": "invalid method"}), 405
 
-# --- These sections are for initial setup ---
-async def setup_webhook():
-    """
-    Runs once to tell Telegram where to send updates.
-    """
-    if not WEBHOOK_URL:
-        logger.error("WEBHOOK_URL is not set in environment variables.")
-        return
-        
-    # Build the full webhook URL
-    full_webhook_url = f"{WEBHOOK_URL}/webhook"
-    
-    # Set the webhook
-    await telegram_app.bot.set_webhook(full_webhook_url)
-    logger.info(f"Webhook set to {full_webhook_url}")
+# --- NEW: Run setup when Gunicorn starts ---
+# This code runs when Gunicorn imports the file (i.e., when the worker starts)
+if __name__ != "__main__":
+    try:
+        logger.info("Running initial setup...")
+        asyncio.run(setup_bot_and_webhook())
+        logger.info("Initial setup complete.")
+    except Exception as e:
+        logger.error(f"Failed to run initial setup: {e}")
 
-# Special command for setup on Render
-# Render can run this after the build
-@app.route("/setup")
-def setup():
-    """
-    A route that Render can call to set the webhook.
-    This can be called from Render's "Build Command".
-    """
-    import asyncio
-    asyncio.run(setup_webhook())
-    return "Webhook setup finished!"
+# --- OLD: /setup route (REMOVED) ---
+# We don't need this route anymore, setup runs automatically
+# @app.route("/setup")
+# def setup():
+#     ...
 
 # This part is only for local testing
-# gunicorn directly uses the 'app' variable
 if __name__ == "__main__":
+    # Note: Local testing might behave differently now
+    # It's best to rely on the Render deployment
+    logger.info("Running in local debug mode...")
     app.run(debug=True, port=5001)
