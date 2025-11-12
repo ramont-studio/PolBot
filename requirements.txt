@@ -1,6 +1,7 @@
-flask
+Flask[async]
 python-telegram-bot
 google-api-python-client
 google-auth-httplib2
 google-auth-oauthlib
 gunicorn
+
