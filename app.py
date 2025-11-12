@@ -2,12 +2,14 @@ import os
 import io
 import json
 import logging
-import asyncio # <-- Added import
+import asyncio
+import threading  # <-- 1. Import threading
 from flask import Flask, request, jsonify
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.constants import ParseMode
+from telegram.error import BadRequest  # <-- 2. Import specific error
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -25,22 +27,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Google Drive Section ---
-# (This section is unchanged)
+# --- Google Drive Section (Unchanged) ---
 
 def get_drive_service():
-    """
-    Creates the Google Drive service using the service account credentials file.
-    """
     scopes = ["https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
     service = build("drive", "v3", credentials=creds)
     return service
 
 def upload_to_drive(service, file_stream, file_name):
-    """
-    Uploads the file (in memory) to the specified Google Drive folder.
-    """
     try:
         file_metadata = {
             "name": file_name,
@@ -55,13 +50,12 @@ def upload_to_drive(service, file_stream, file_name):
         ).execute()
         
         logger.info(f"File uploaded successfully. ID: {file.get('id')}")
-        return file.get('webViewLink') # Returns the file's view link
+        return file.get('webViewLink')
     except Exception as e:
         logger.error(f"Error uploading file: {e}")
         return None
 
 # --- Telegram Bot Section ---
-# (This section is unchanged)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Response to the /start command"""
@@ -69,7 +63,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    This function is executed when any file, photo, or video is sent.
+    Handles files, photos, videos, or audio.
     """
     message = update.message
     file_name = ""
@@ -119,21 +113,33 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await status_message.edit_text("❌ مشکلی در آپلود فایل پیش آمد.")
             
+    except BadRequest as e:
+        # <-- 3. Catch the specific "File is too big" error
+        if "File is too big" in e.message:
+            logger.warning(f"File too big: {file_name}")
+            await status_message.edit_text("❌ خطا: فایل خیلی بزرگ است.\nمن فقط می‌توانم فایل‌های تا ۲۰ مگابایت را پردازش کنم.")
+        else:
+            logger.error(f"BadRequest error processing file: {e}")
+            await status_message.edit_text(f"خطای تلگرام: {e.message}")
+            
     except Exception as e:
         logger.error(f"General error processing file: {e}")
-        await status_message.edit_text(f"خطا: {e}")
+        await status_message.edit_text(f"خطای ناشناخته: {e}")
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Logs the error."""
+    # <-- 4. Add a proper error handler
+    logger.error(f"Exception while handling an update: {context.error}", exc_info=context.error)
+
 
 # --- Bot and Flask Initialization ---
 
-# Initialize the Flask application
 app = Flask(__name__)
 
-# Initialize the Telegram bot application
 telegram_app = (
     Application.builder().token(TOKEN).build()
 )
 
-# Add commands to the bot
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(
     MessageHandler(
@@ -141,17 +147,23 @@ telegram_app.add_handler(
         handle_file
     )
 )
+telegram_app.add_error_handler(error_handler)  # <-- 5. Register the error handler
 
-# --- Webhook Setup Function (Modified) ---
+# --- Thread-safe setup logic ---
+# <-- 6. This is the new, thread-safe setup logic
+setup_lock = threading.Lock()
+setup_done = False
+
 async def setup_bot_and_webhook():
     """
     Initializes the bot application AND sets the webhook.
+    Runs only ONCE.
     """
     logger.info("Initializing application...")
-    await telegram_app.initialize() # <-- THIS IS THE FIX
+    await telegram_app.initialize()
     
     if not WEBHOOK_URL:
-        logger.error("WEBHOOK_URL is not set in environment variables.")
+        logger.error("WEBHOOK_URL is not set.")
         return
         
     full_webhook_url = f"{WEBHOOK_URL}/webhook"
@@ -159,7 +171,24 @@ async def setup_bot_and_webhook():
     logger.info(f"Setting webhook to {full_webhook_url}...")
     await telegram_app.bot.set_webhook(full_webhook_url)
     logger.info("Webhook set successfully.")
+    logger.info("Initial setup complete.")
 
+@app.before_request
+def ensure_setup_is_done():
+    """
+    This function runs before *every* request.
+    It uses a lock to ensure the async setup runs exactly once.
+    """
+    global setup_done
+    with setup_lock:
+        if not setup_done:
+            logger.info("First request received. Running initial setup...")
+            try:
+                # We need to run the async setup function
+                asyncio.run(setup_bot_and_webhook())
+                setup_done = True
+            except Exception as e:
+                logger.error(f"Failed to run initial setup: {e}")
 
 # --- Flask Web Server Routes ---
 
@@ -173,36 +202,13 @@ async def webhook():
     """
     This is the address where Telegram sends messages (Webhook)
     """
-    if request.method == "POST":
-        try:
-            update = Update.de_json(request.get_json(force=True), telegram_app.bot)
-            await telegram_app.process_update(update)
-            return jsonify({"status": "ok"})
-        except Exception as e:
-            # Log the *actual* error
-            logger.error(f"Error processing update: {e}")
-            return jsonify({"status": "error", "message": str(e)}), 500
-    return jsonify({"status": "invalid method"}), 405
-
-# --- NEW: Run setup when Gunicorn starts ---
-# This code runs when Gunicorn imports the file (i.e., when the worker starts)
-if __name__ != "__main__":
     try:
-        logger.info("Running initial setup...")
-        asyncio.run(setup_bot_and_webhook())
-        logger.info("Initial setup complete.")
+        update = Update.de_json(request.get_json(force=True), telegram_app.bot)
+        await telegram_app.process_update(update)
+        return jsonify({"status": "ok"})
     except Exception as e:
-        logger.error(f"Failed to run initial setup: {e}")
+        logger.error(f"Error processing update in webhook: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-# --- OLD: /setup route (REMOVED) ---
-# We don't need this route anymore, setup runs automatically
-# @app.route("/setup")
-# def setup():
-#     ...
-
-# This part is only for local testing
-if __name__ == "__main__":
-    # Note: Local testing might behave differently now
-    # It's best to rely on the Render deployment
-    logger.info("Running in local debug mode...")
-    app.run(debug=True, port=5001)
+# We no longer need the 'if __name__ == "__main__":' block
+# Gunicorn will handle running the app.
