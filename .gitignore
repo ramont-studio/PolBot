@@ -1,0 +1,8 @@
+# Python
+*.pyc
+__pycache__/
+venv/
+*.env
+
+# Secrets
+google_creds.json
